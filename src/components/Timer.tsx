@@ -1,55 +1,27 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import ModeSelector from './ModeSelector';
+import CircularProgress from './CircularProgress';
+import StatsPanel from './StatsPanel';
+import SettingsPanel from './SettingsPanel';
+import { TimerMode, CustomDurations } from './TimerTypes';
 
-type TimerMode = 'pomodoro' | 'shortBreak' | 'longBreak';
+const TIMER_STATE_KEY = 'pomodoro-timer-state';
 
-interface ModeConfig {
-  label: string;
-  minutes: number;
-  color: string;
-  textClass: string;
-  borderClass: string;
-  bgHoverClass: string;
-  shadowStyle: React.CSSProperties;
+interface SavedTimerState {
+  mode: TimerMode;
+  secondsLeft: number;
+  isRunning: boolean;
+  savedAt: number;
 }
-
-const MODE_CONFIG: Record<TimerMode, ModeConfig> = {
-  pomodoro: {
-    label: 'Pomodoro',
-    minutes: 25,
-    color: 'neon-cyan',
-    textClass: 'text-neon-cyan',
-    borderClass: 'border-neon-cyan',
-    bgHoverClass: 'hover:bg-neon-cyan/10',
-    shadowStyle: { textShadow: '0 0 10px rgba(0,240,255,0.7), 0 0 20px rgba(0,240,255,0.4)' },
-  },
-  shortBreak: {
-    label: 'Short Break',
-    minutes: 5,
-    color: 'neon-lime',
-    textClass: 'text-neon-lime',
-    borderClass: 'border-neon-lime',
-    bgHoverClass: 'hover:bg-neon-lime/10',
-    shadowStyle: { textShadow: '0 0 10px rgba(170,255,0,0.7), 0 0 20px rgba(170,255,0,0.4)' },
-  },
-  longBreak: {
-    label: 'Long Break',
-    minutes: 15,
-    color: 'neon-magenta',
-    textClass: 'text-neon-magenta',
-    borderClass: 'border-neon-magenta',
-    bgHoverClass: 'hover:bg-neon-magenta/10',
-    shadowStyle: { textShadow: '0 0 10px rgba(255,0,255,0.7), 0 0 20px rgba(255,0,255,0.4)' },
-  },
-} as const;
 
 export default function Timer() {
   const [mode, setMode] = useState<TimerMode>('pomodoro');
-  const [secondsLeft, setSecondsLeft] = useState(MODE_CONFIG[mode].minutes * 60);
+  const [secondsLeft, setSecondsLeft] = useState(25 * 60);
   const [isRunning, setIsRunning] = useState(false);
   const [completedSessions, setCompletedSessions] = useState(0);
-  const [customDurations, setCustomDurations] = useState({
+  const [customDurations, setCustomDurations] = useState<CustomDurations>({
     pomodoro: 25,
     shortBreak: 5,
     longBreak: 15,
@@ -57,8 +29,14 @@ export default function Timer() {
   const [todaySessions, setTodaySessions] = useState(0);
   const [weekSessions, setWeekSessions] = useState(0);
   const [streak, setStreak] = useState(0);
+  const [dailyGoal, setDailyGoal] = useState(8);
+  const [volume, setVolume] = useState(0.5);
+  const [selectedSound, setSelectedSound] = useState('beep');
+  const [isMuted, setIsMuted] = useState(false);
+  
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const notificationPermission = useRef<'granted' | 'denied' | 'default'>('default');
+  const completionHandledRef = useRef(false);
 
   // Request notification permission on mount
   useEffect(() => {
@@ -71,8 +49,39 @@ export default function Timer() {
     }
   }, []);
 
-  // Load data from localStorage
+  // Load all data from localStorage
   useEffect(() => {
+    // Load timer state
+    const savedTimer = localStorage.getItem(TIMER_STATE_KEY);
+    if (savedTimer) {
+      try {
+        const state: SavedTimerState = JSON.parse(savedTimer);
+        const { mode: savedMode, secondsLeft: savedSeconds, isRunning: savedRunning, savedAt } = state;
+        
+        if (savedMode && savedSeconds !== undefined) {
+          let adjustedSeconds = savedSeconds;
+          
+          if (savedRunning && savedAt) {
+            const elapsedSec = Math.floor((Date.now() - savedAt) / 1000);
+            adjustedSeconds = Math.max(0, savedSeconds - elapsedSec);
+
+            if (adjustedSeconds === 0) {
+              setTimeout(() => {
+                handleTimerComplete();
+              }, 100);
+            }
+          }
+          
+          setMode(savedMode);
+          setSecondsLeft(adjustedSeconds);
+          setIsRunning(savedRunning && adjustedSeconds > 0);
+        }
+      } catch (e) {
+        console.error('Failed to load timer state', e);
+      }
+    }
+
+    // Load other data
     const saved = localStorage.getItem('pomodoro-completed-sessions');
     if (saved) setCompletedSessions(parseInt(saved, 10) || 0);
 
@@ -81,94 +90,133 @@ export default function Timer() {
       setCustomDurations(JSON.parse(savedDurations));
     }
 
-    // Load today's sessions
     const today = new Date().toDateString();
     const savedToday = localStorage.getItem(`pomodoro-today-${today}`);
     if (savedToday) setTodaySessions(parseInt(savedToday, 10) || 0);
 
-    // Load week sessions
     const weekStart = new Date();
     weekStart.setDate(weekStart.getDate() - weekStart.getDay());
     const savedWeek = localStorage.getItem(`pomodoro-week-${weekStart.toDateString()}`);
     if (savedWeek) setWeekSessions(parseInt(savedWeek, 10) || 0);
 
-    // Load streak
+    // Load streak with proper date tracking
     const savedStreak = localStorage.getItem('pomodoro-streak');
-    if (savedStreak) setStreak(parseInt(savedStreak, 10) || 0);
+    const savedStreakDate = localStorage.getItem('pomodoro-streak-date');
+    if (savedStreak && savedStreakDate) {
+      const lastDate = new Date(savedStreakDate);
+      const todayDate = new Date();
+      const diffDays = Math.floor((todayDate.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
+      
+      if (diffDays === 0) {
+        // Same day, keep streak
+        setStreak(parseInt(savedStreak, 10) || 0);
+      } else if (diffDays === 1) {
+        // Consecutive day, keep streak
+        setStreak(parseInt(savedStreak, 10) || 0);
+      } else {
+        // Streak broken
+        setStreak(0);
+      }
+    }
+
+    const savedGoal = localStorage.getItem('pomodoro-daily-goal');
+    if (savedGoal) setDailyGoal(parseInt(savedGoal, 10) || 8);
+
+    const savedVolume = localStorage.getItem('pomodoro-volume');
+    if (savedVolume) setVolume(parseFloat(savedVolume) || 0.5);
+    
+    const savedSound = localStorage.getItem('pomodoro-selected-sound');
+    if (savedSound) setSelectedSound(savedSound);
+    
+    const savedMuted = localStorage.getItem('pomodoro-muted');
+    if (savedMuted) setIsMuted(savedMuted === 'true');
   }, []);
 
-  // Save completed sessions
+  // Save timer state
+  useEffect(() => {
+    const state: SavedTimerState = {
+      mode,
+      secondsLeft,
+      isRunning,
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(TIMER_STATE_KEY, JSON.stringify(state));
+  }, [mode, secondsLeft, isRunning]);
+
+  // Save other states
   useEffect(() => {
     localStorage.setItem('pomodoro-completed-sessions', completedSessions.toString());
   }, [completedSessions]);
 
-  // Save custom durations
   useEffect(() => {
     localStorage.setItem('pomodoro-custom-durations', JSON.stringify(customDurations));
-    // Update current timer if mode matches
-    setSecondsLeft(customDurations[mode] * 60);
   }, [customDurations]);
 
-  // Save today sessions
   useEffect(() => {
     const today = new Date().toDateString();
     localStorage.setItem(`pomodoro-today-${today}`, todaySessions.toString());
   }, [todaySessions]);
 
-  // Save week sessions
   useEffect(() => {
     const weekStart = new Date();
     weekStart.setDate(weekStart.getDate() - weekStart.getDay());
     localStorage.setItem(`pomodoro-week-${weekStart.toDateString()}`, weekSessions.toString());
   }, [weekSessions]);
 
-  // Save streak
   useEffect(() => {
     localStorage.setItem('pomodoro-streak', streak.toString());
+    localStorage.setItem('pomodoro-streak-date', new Date().toDateString());
   }, [streak]);
 
-  // Handle timer tick
-  const tick = useCallback(() => {
-    setSecondsLeft((prev) => {
-      if (prev <= 1) {
-        handleTimerComplete();
-        return 0;
-      }
-      return prev - 1;
-    });
-  }, []);
+  useEffect(() => {
+    localStorage.setItem('pomodoro-daily-goal', dailyGoal.toString());
+  }, [dailyGoal]);
 
-  const handleTimerComplete = () => {
-    setIsRunning(false);
-    
+  useEffect(() => {
+    localStorage.setItem('pomodoro-volume', volume.toString());
+  }, [volume]);
+
+  useEffect(() => {
+    localStorage.setItem('pomodoro-selected-sound', selectedSound);
+  }, [selectedSound]);
+
+  useEffect(() => {
+    localStorage.setItem('pomodoro-muted', isMuted.toString());
+  }, [isMuted]);
+
+  // Handle timer completion
+  const handleTimerComplete = useCallback(() => {
+    if (completionHandledRef.current) return;
+    completionHandledRef.current = true;
+
     if (mode === 'pomodoro') {
       const newCompleted = completedSessions + 1;
       setCompletedSessions(newCompleted);
       setTodaySessions((prev) => prev + 1);
       setWeekSessions((prev) => prev + 1);
       
-      // Update streak
-      const lastDate = localStorage.getItem('pomodoro-last-date');
+      // Update streak properly
+      const lastStreakDate = localStorage.getItem('pomodoro-streak-date');
       const today = new Date().toDateString();
-      if (lastDate !== today) {
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        if (lastDate === yesterday.toDateString()) {
-          setStreak((prev) => prev + 1);
-        } else if (lastDate !== today) {
-          setStreak(1);
-        }
-        localStorage.setItem('pomodoro-last-date', today);
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      
+      if (lastStreakDate === yesterday.toDateString()) {
+        // Consecutive day
+        setStreak((prev) => prev + 1);
+      } else if (lastStreakDate !== today) {
+        // New streak
+        setStreak(1);
       }
+      localStorage.setItem('pomodoro-streak-date', today);
 
-      // Auto-switch to break after pomodoro
+      // Auto-switch to break
       if (newCompleted % 4 === 0) {
         setMode('longBreak');
       } else {
         setMode('shortBreak');
       }
 
-      // Show notification
       if (notificationPermission.current === 'granted') {
         new Notification('Pomodoro Complete! 🎉', {
           body: `Great work! You've completed ${newCompleted} sessions.`,
@@ -176,7 +224,6 @@ export default function Timer() {
         });
       }
     } else {
-      // After break, switch back to pomodoro
       setMode('pomodoro');
       
       if (notificationPermission.current === 'granted') {
@@ -187,13 +234,41 @@ export default function Timer() {
       }
     }
 
-    // Play sound
-    const audio = new Audio('https://assets.mixkit.co/sfx/preview/mixkit-alarm-digital-clock-beep-989.mp3');
+    if (!isMuted) {
+      playSound();
+    }
+
+    setTimeout(() => {
+      completionHandledRef.current = false;
+    }, 1000);
+  }, [mode, completedSessions, isMuted]);
+
+  const playSound = () => {
+    const soundUrls: Record<string, string> = {
+      beep: 'https://assets.mixkit.co/sfx/preview/mixkit-alarm-digital-clock-beep-989.mp3',
+      chime: 'https://assets.mixkit.co/sfx/preview/mixkit-morning-birds-chirping-2460.mp3',
+      bell: 'https://assets.mixkit.co/sfx/preview/mixkit-classic-alarm-995.mp3',
+      aggressive: 'https://assets.mixkit.co/sfx/preview/mixkit-sci-fi-alarm-990.mp3',
+    };
+
+    const audio = new Audio(soundUrls[selectedSound] || soundUrls.beep);
+    audio.volume = volume;
     audio.play().catch(() => {
-      // Fallback: try a different sound or just ignore
       console.log('Audio playback failed');
     });
   };
+
+  // Timer tick
+  const tick = useCallback(() => {
+    setSecondsLeft((prev) => {
+      if (prev <= 1) {
+        setIsRunning(false);
+        handleTimerComplete();
+        return 0;
+      }
+      return prev - 1;
+    });
+  }, [handleTimerComplete]);
 
   useEffect(() => {
     if (isRunning && secondsLeft > 0) {
@@ -209,9 +284,10 @@ export default function Timer() {
   useEffect(() => {
     setIsRunning(false);
     setSecondsLeft(customDurations[mode] * 60);
+    completionHandledRef.current = false;
   }, [mode, customDurations]);
 
-  // Update page title with timer
+  // Update page title
   useEffect(() => {
     if (isRunning && secondsLeft > 0) {
       const timeStr = formatTime(secondsLeft);
@@ -226,7 +302,7 @@ export default function Timer() {
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement) return; // Don't trigger when typing
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
       
       switch (e.key) {
         case ' ':
@@ -248,6 +324,12 @@ export default function Timer() {
         case '3':
           setMode('longBreak');
           break;
+        case 's':
+        case 'S':
+          if (mode !== 'pomodoro') {
+            setMode('pomodoro');
+          }
+          break;
       }
     };
 
@@ -255,11 +337,35 @@ export default function Timer() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isRunning, mode]);
 
+  // Save state before unload
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      const state: SavedTimerState = {
+        mode,
+        secondsLeft,
+        isRunning,
+        savedAt: Date.now(),
+      };
+      localStorage.setItem(TIMER_STATE_KEY, JSON.stringify(state));
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [mode, secondsLeft, isRunning]);
+
   const toggleTimer = () => setIsRunning((prev) => !prev);
   
   const resetTimer = () => {
     setIsRunning(false);
     setSecondsLeft(customDurations[mode] * 60);
+    completionHandledRef.current = false;
+    localStorage.removeItem(TIMER_STATE_KEY);
+  };
+
+  const skipBreak = () => {
+    if (mode !== 'pomodoro') {
+      setMode('pomodoro');
+    }
   };
 
   const formatTime = (secs: number) => {
@@ -268,133 +374,59 @@ export default function Timer() {
     return `${m}:${s}`;
   };
 
-  const currentMode = MODE_CONFIG[mode];
-  const totalSeconds = customDurations[mode] * 60;
-  const progress = ((totalSeconds - secondsLeft) / totalSeconds) * 100;
-  const radius = 120;
-  const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (progress / 100) * circumference;
-
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-4">
       <h1 className="text-4xl font-bold mb-8 neon-text-cyan">Daily Focus Timer</h1>
       
-      {/* Mode Selector */}
-      <div className="flex gap-4 mb-8">
-        {(Object.keys(MODE_CONFIG) as TimerMode[]).map((m) => {
-          const config = MODE_CONFIG[m];
-          const isActive = mode === m;
-          return (
-            <button
-              key={m}
-              onClick={() => setMode(m)}
-              className={`px-4 py-2 rounded-lg border-2 transition-all ${
-                isActive
-                  ? `${config.textClass} ${config.borderClass} bg-opacity-20 ${config.bgHoverClass}`
-                  : 'text-gray-400 border-gray-600 hover:border-gray-400'
-              }`}
-              style={isActive ? config.shadowStyle : undefined}
-            >
-              {config.label}
-            </button>
-          );
-        })}
-      </div>
+      <ModeSelector mode={mode} setMode={setMode} />
 
-      {/* Timer Display with Circular Progress */}
-      <div className="relative mb-8">
-        <svg width={300} height={300} className="-rotate-90">
-          {/* Background circle */}
-          <circle
-            cx={150}
-            cy={150}
-            r={radius}
-            fill="none"
-            stroke="#1a1a2e"
-            strokeWidth={8}
-          />
-          {/* Progress circle */}
-          <circle
-            cx={150}
-            cy={150}
-            r={radius}
-            fill="none"
-            stroke={mode === 'pomodoro' ? '#00f0ff' : mode === 'shortBreak' ? '#aaff00' : '#ff00ff'}
-            strokeWidth={8}
-            strokeLinecap="round"
-            strokeDasharray={circumference}
-            strokeDashoffset={strokeDashoffset}
-            className="transition-all duration-1000 ease-linear"
-          />
-        </svg>
-        <div className="absolute inset-0 flex items-center justify-center">
-          <span 
-            className={`text-9xl font-mono font-bold ${currentMode.textClass}`}
-            style={currentMode.shadowStyle}
-          >
-            {formatTime(secondsLeft)}
-          </span>
-        </div>
-      </div>
+      <CircularProgress 
+        mode={mode}
+        secondsLeft={secondsLeft}
+        customDurations={customDurations}
+        isRunning={isRunning}
+        formatTime={formatTime}
+      />
 
       {/* Controls */}
-      <div className="flex gap-4 mb-8">
+      <div className="flex flex-wrap gap-4 mb-4 justify-center">
         <button onClick={toggleTimer} className="neon-button min-w-[120px]">
           {isRunning ? 'Pause ⏸' : 'Start ▶'}
         </button>
         <button onClick={resetTimer} className="neon-button min-w-[120px]">
           Reset ↺
         </button>
+        {mode !== 'pomodoro' && (
+          <button onClick={skipBreak} className="neon-button min-w-[120px]">
+            Skip Break →
+          </button>
+        )}
       </div>
 
-      {/* Custom Duration Settings */}
-      <div className="mb-8 p-4 border border-gray-700 rounded-lg bg-gray-900/50">
-        <h3 className="text-lg font-semibold mb-3 text-gray-300">Custom Durations (minutes)</h3>
-        <div className="flex gap-4">
-          {(['pomodoro', 'shortBreak', 'longBreak'] as TimerMode[]).map((m) => (
-            <div key={m} className="flex flex-col items-center">
-              <label className="text-sm text-gray-400 mb-1">{MODE_CONFIG[m].label}</label>
-              <input
-                type="number"
-                min={1}
-                max={60}
-                value={customDurations[m]}
-                onChange={(e) => {
-                  const val = parseInt(e.target.value) || 1;
-                  setCustomDurations((prev) => ({ ...prev, [m]: val }));
-                }}
-                className="w-20 px-2 py-1 bg-gray-800 border border-gray-600 rounded text-center text-neon-cyan focus:border-neon-cyan focus:outline-none"
-              />
-            </div>
-          ))}
-        </div>
-      </div>
+      <SettingsPanel
+        customDurations={customDurations}
+        setCustomDurations={setCustomDurations}
+        dailyGoal={dailyGoal}
+        setDailyGoal={setDailyGoal}
+        volume={volume}
+        setVolume={setVolume}
+        selectedSound={selectedSound}
+        setSelectedSound={setSelectedSound}
+        isMuted={isMuted}
+        setIsMuted={setIsMuted}
+        todaySessions={todaySessions}
+      />
 
-      {/* Stats */}
-      <div className="text-center text-gray-300">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-          <div className="p-3 border border-gray-700 rounded-lg bg-gray-900/50">
-            <p className="text-sm text-gray-400">Today</p>
-            <p className="text-2xl font-bold neon-text-lime">{todaySessions}</p>
-          </div>
-          <div className="p-3 border border-gray-700 rounded-lg bg-gray-900/50">
-            <p className="text-sm text-gray-400">This Week</p>
-            <p className="text-2xl font-bold neon-text-cyan">{weekSessions}</p>
-          </div>
-          <div className="p-3 border border-gray-700 rounded-lg bg-gray-900/50">
-            <p className="text-sm text-gray-400">Total</p>
-            <p className="text-2xl font-bold neon-text-magenta">{completedSessions}</p>
-          </div>
-          <div className="p-3 border border-gray-700 rounded-lg bg-gray-900/50">
-            <p className="text-sm text-gray-400">Streak</p>
-            <p className="text-2xl font-bold text-yellow-400">{streak} 🔥</p>
-          </div>
-        </div>
-        <p className="text-sm text-gray-500">Saved locally in your browser</p>
-        <p className="text-xs text-gray-600 mt-2">
-          Shortcuts: Space (start/pause), R (reset), 1/2/3 (switch modes)
-        </p>
-      </div>
+      <StatsPanel 
+        todaySessions={todaySessions}
+        weekSessions={weekSessions}
+        completedSessions={completedSessions}
+        streak={streak}
+      />
+
+      <p className="text-xs text-gray-600 mt-4">
+        Shortcuts: Space (start/pause), R (reset), 1/2/3 (switch modes), S (skip break)
+      </p>
     </div>
   );
 }
